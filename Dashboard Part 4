@@ -1,0 +1,79 @@
+// Search log data from both application and equipment logs for site ZLXH with specific events and functions
+(index=uds_equipment sourcetype="equipment.log") OR (index=uds_application sourcetype="uds.core.log") site=ZLXH Function="validate*" Event IN ("ReceiveMessage","SendMessage") 
+
+// Convert the entire raw message into JSON format for easier field extraction
+| tojson output_field=my_JSON_field 
+
+// Extract the sort area name from the source file path
+| rex field=source "Core\.(?<sort_area>\w+)" 
+
+// Enrich data by looking up the sort area type (e.g., DH) from a CSV file
+| lookup sort_area_type.csv area_name as sort_area output area_type as sort_area_type 
+
+// Filter for sort area type of interest (e.g., DH = Direct Handling)
+| search sort_area_type=DH 
+
+// Extract barcodes and other key fields from the message
+| eval loading_unit=coalesce(json_extract(Message,"Barcode"),json_extract(Message,"LoadingUnit.Barcode")) 
+| eval handling_unit=json_extract(Message,"HandlingUnit.Barcode") 
+| eval tracking_number=json_extract(Message,"TrackingNumber")
+| eval handlingunit_info=json_extract(Message,"HandlingUnits")
+| eval result=json_extract(Message,"Result") 
+| eval sort_plan=json_extract(Message,"SplitName.SortPlanName") 
+| eval sort_area=json_extract(Message,"SplitName.AreaName") 
+| eval origin=json_extract(Message,"Origin") 
+| eval destination=json_extract(Message,"Destination") 
+| eval scan_user_id=json_extract(Message,"ScanUserId") 
+| eval device_id=json_extract(Message,"DeviceId") 
+| eval scan_date_time=json_extract(Message,"ScanDateTime") 
+| eval sort_rule=json_extract(Message,"SplitName.ShortName") 
+| eval sort_rule_type=json_extract(Message,"SortedByRuleType") 
+
+// Collapse duplicate events, keeping only the latest data for each context
+| stats latest(*) as * by Context 
+
+// Organize selected fields for readability and relevance
+| table _time site Event Function Context loading_unit handling_unit tracking_number result sort_plan sort_area origin destination scan_user_id device_id scan_date_time sort_rule sort_rule_type, result handlingunit_info 
+
+// Filter out events with missing or invalid handling_unit
+| where isnotnull(handling_unit) AND len(handling_unit) < 40 
+
+// Join with newly created loading units in the past week to associate validation with creation
+| join type=inner loading_unit
+    [ search 
+      (index=uds_equipment sourcetype="equipment.log") OR (index=uds_application sourcetype="uds.core.log") site=ZLXH earliest=-1w 
+      Event IN ("ReceiveMessage","SendMessage") Function="newconscreated" 
+      
+      // Convert message to JSON
+      | tojson output_field=my_JSON_field 
+
+      // Extract sort area again and enrich with area type
+      | rex field=source "Core\.(?<sort_area>\w+)" 
+      | lookup sort_area_type.csv area_name as sort_area output area_type as sort_area_type 
+      | search sort_area_type=DH 
+
+      // Extract relevant fields from the message
+      | eval loading_unit=coalesce(json_extract(Message,"Barcode"),json_extract(Message,"LoadingUnit.Barcode")) 
+      | eval type=json_extract(Message,"Type") 
+      | eval tracking_number=json_extract(Message,"TrackingNumber") 
+      | eval origin=json_extract(Message,"Origin") 
+      | eval sort_plan=json_extract(Message,"SplitName.SortPlanName") 
+      | eval sort_rule=json_extract(Message,"SplitName.ShortName") 
+      | eval sort_rule_type=json_extract(Message,"SortedByRuleType") 
+      | eval destination=json_extract(Message,"Destination") 
+
+      // Table selected fields and ensure valid loading units
+      | table _time Function loading_unit sort_plan sort_rule type sort_area origin destination tracking_number
+      | search loading_unit>0 
+      | table loading_unit, sort_plan, sort_rule, type tracking_number sort_area origin destination
+    ]
+
+// Ensure joined events are valid and complete
+| where isnotnull(handling_unit) 
+| search sort_plan="*" sort_rule="*" type="*"
+
+// Remove duplicates by loading unit to avoid double-counting
+| dedup loading_unit
+
+// Final output table for the dashboard or report
+| table loading_unit, scan_date_time, tracking_number, sort_plan, type, sort_area, origin, destination, scan_user_id, device_id, sort_rule handlingunit_info
